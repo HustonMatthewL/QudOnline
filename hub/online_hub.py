@@ -7,6 +7,8 @@
   python3 online_hub.py --tick 0.025     length of a round's window in seconds
   python3 online_hub.py --selftest       start a hub, talk to it, report
   python3 online_hub.py --compare A B    say how two stored snapshots differ
+  python3 online_hub.py --history        also keep every store of a world zone in hub-store/history/<zone>/
+  python3 online_hub.py --churn DIR      difference sizes between the snapshots of a history folder
 
 A frame is: payload length (4 bytes, little-endian), message type (1 byte), request number (4 bytes), payload.
 The hub answers every request with a REPLY or FAILURE frame carrying the same request number. Stored zones are
@@ -73,6 +75,8 @@ BUILD_CLAIM = 15.0
 HEADER = struct.Struct("<IBI")
 MAX_PAYLOAD = 64 * 1024 * 1024
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub-store")
+# --history: every store of a world zone is also kept, numbered, for studying how zones change between updates.
+HISTORY = False
 WORLD_KEY = re.compile(r"^[A-Za-z0-9._-]+$")
 
 store = {}
@@ -183,6 +187,14 @@ def split_store(payload):
 def keep(key, data):
     os.makedirs(os.path.dirname(file_for(key)), exist_ok=True)
     with open(file_for(key), "wb") as out:
+        out.write(data)
+
+
+def keep_history(key, data):
+    """Keeps one more version of a world zone in hub-store/history/<zone>/, numbered in order of arrival."""
+    folder = os.path.join(STORE_DIR, "history", key)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "%05d.bin" % len(os.listdir(folder))), "wb") as out:
         out.write(data)
 
 
@@ -381,6 +393,8 @@ class Handler(socketserver.BaseRequestHandler):
                 before = store.get(key)
                 store[key] = data
                 keep(key, data)
+                if HISTORY and in_world(key):
+                    keep_history(key, data)
             self.send(REPLY, request)
             if in_world(key):
                 self.pass_on_store(key, payload)
@@ -480,7 +494,9 @@ class Handler(socketserver.BaseRequestHandler):
 
 # The difference between two snapshots, as QUDOnline/CS/ZoneDelta.cs makes and applies it. The hub does not use
 # it; it is here so the format has a second implementation that the self-test checks.
-DELTA_BLOCK, DELTA_MULTIPLIER = 32, 1000003
+DELTA_BLOCK, DELTA_MULTIPLIER = 16, 1000003
+# A copy stops once more than DELTA_MAX_MISSES of its last DELTA_WINDOW bytes differ (see ZoneDelta.cs).
+DELTA_WINDOW, DELTA_MAX_MISSES = 16, 8
 
 
 def fnv(data):
@@ -507,7 +523,7 @@ def delta_hash(data, at):
 
 
 def delta_make(old, new):
-    out = bytearray(struct.pack("<IIII", len(old), fnv(old), len(new), fnv(new)))
+    instructions, adds, literals = bytearray(), bytearray(), bytearray()
     index = {}
     for i in range(0, len(old) - DELTA_BLOCK + 1, DELTA_BLOCK):
         index.setdefault(delta_hash(old, i), i)
@@ -518,14 +534,30 @@ def delta_make(old, new):
     while at < length:
         start = index.get(window) if windowed else None
         if start is not None and old[start:start + DELTA_BLOCK] == new[at:at + DELTA_BLOCK]:
-            run = DELTA_BLOCK
-            while start + run < len(old) and at + run < length and old[start + run] == new[at + run]:
+            run = kept = DELTA_BLOCK
+            missed = [False] * DELTA_WINDOW
+            misses = 0
+            while start + run < len(old) and at + run < length:
+                slot = run % DELTA_WINDOW
+                if missed[slot]:
+                    missed[slot] = False
+                    misses -= 1
+                if old[start + run] == new[at + run]:
+                    kept = run + 1
+                else:
+                    missed[slot] = True
+                    misses += 1
+                    if misses > DELTA_MAX_MISSES:
+                        break
                 run += 1
+            run = kept
             while at > pending and start > 0 and old[start - 1] == new[at - 1]:
                 start, at, run = start - 1, at - 1, run + 1
             if at > pending:
-                out += b"\x00" + delta_number(at - pending) + new[pending:at]
-            out += b"\x01" + delta_number(start) + delta_number(run)
+                instructions += b"\x00" + delta_number(at - pending)
+                literals += new[pending:at]
+            instructions += b"\x01" + delta_number(start) + delta_number(run)
+            adds += bytes((new[at + k] - old[start + k]) & 255 for k in range(run))
             at += run
             pending = at
             windowed = at + DELTA_BLOCK <= length
@@ -538,15 +570,21 @@ def delta_make(old, new):
                 windowed = False
             at += 1
     if length > pending:
-        out += b"\x00" + delta_number(length - pending) + new[pending:]
-    return bytes(out)
+        instructions += b"\x00" + delta_number(length - pending)
+        literals += new[pending:]
+    header = struct.pack("<IIIIIII", len(old), fnv(old), len(new), fnv(new), len(instructions), len(adds),
+        len(literals))
+    return header + bytes(instructions) + bytes(adds) + bytes(literals)
 
 
 def delta_apply(old, delta):
-    old_length, old_hash, length, new_hash = struct.unpack_from("<IIII", delta, 0)
-    if old_length != len(old) or old_hash != fnv(old):
+    if len(delta) < 28:
         return None
-    out, at = bytearray(), 16
+    old_length, old_hash, length, new_hash, counted, added, carried = struct.unpack_from("<IIIIIII", delta, 0)
+    if old_length != len(old) or old_hash != fnv(old) or 28 + counted + added + carried != len(delta):
+        return None
+    out, at, end = bytearray(), 28, 28 + counted
+    add, literal = end, end + added
 
     def number():
         nonlocal at
@@ -559,17 +597,28 @@ def delta_apply(old, delta):
                 return value
             shift += 7
 
-    while at < len(delta):
-        kind = delta[at]
-        at += 1
-        if kind == 0:
-            count = number()
-            out += delta[at:at + count]
-            at += count
-        else:
-            start = number()
-            count = number()
-            out += old[start:start + count]
+    try:
+        while at < end:
+            kind = delta[at]
+            at += 1
+            if kind == 0:
+                count = number()
+                if literal + count > len(delta):
+                    return None
+                out += delta[literal:literal + count]
+                literal += count
+            elif kind == 1:
+                start, count = number(), number()
+                if start + count > len(old) or add + count > end + added:
+                    return None
+                out += bytes((old[start + k] + delta[add + k]) & 255 for k in range(count))
+                add += count
+            else:
+                return None
+    except IndexError:
+        return None
+    if at != end or add != end + added or literal != len(delta):
+        return None
     return bytes(out) if len(out) == length and fnv(out) == new_hash else None
 
 
@@ -607,9 +656,10 @@ def ask(sock, kind, request, payload=b""):
 
 
 def selftest():
-    global STORE_DIR
+    global STORE_DIR, HISTORY
     import tempfile
     STORE_DIR = tempfile.mkdtemp(prefix="hub-selftest-")
+    HISTORY = True
     hub = Hub(("127.0.0.1", 0), Handler)
     threading.Thread(target=hub.serve_forever, daemon=True).start()
     sock = socket.create_connection(hub.server_address)
@@ -652,6 +702,10 @@ def selftest():
             ("world file", open(os.path.join(world_dir(), zone + ".bin"), "rb").read() == packed[:100]),
             ("test key refused as new zone",
                 ask(sock, STORE_NEW, 15, struct.pack("<H", len(key)) + key.encode() + packed)[0] == FAILURE),
+            ("history keeps every store of a world zone", ask(sock, STORE_ZONE, 21, other) == (REPLY, 21, b"")
+                and [open(os.path.join(STORE_DIR, "history", zone, name), "rb").read()
+                    for name in sorted(os.listdir(os.path.join(STORE_DIR, "history", zone)))] == [packed[:100]] * 2
+                and not os.path.exists(os.path.join(STORE_DIR, "history", key))),
         ]
         store.clear()
         checks.append(("world is read back from disk", load_world() == 1 and store.get(zone) == packed[:100]))
@@ -807,7 +861,7 @@ def selftest():
     newer = base[:2000] + b"moved" + base[2000:9000] + os.urandom(40) + base[9100:] + b"tail"
     made = delta_make(base, newer)
     checks.append(("difference rebuilds the newer snapshot", delta_apply(base, made) == newer
-        and len(made) < len(newer) // 10))
+        and len(gzip.compress(made)) < len(newer) // 10))
     checks.append(("difference is refused for another base", delta_apply(base[1:], made) is None))
     checks.append(("difference of tiny and empty data", delta_apply(b"", delta_make(b"", b"abc")) == b"abc"
         and delta_apply(base, delta_make(base, b"")) == b"" and delta_apply(base, delta_make(base, base)) == base))
@@ -819,9 +873,43 @@ def selftest():
         print("      stored Joppa: whole %d bytes packed, difference %d bytes packed"
             % (len(gzip.compress(second)), len(gzip.compress(made))))
         checks.append(("difference of two stored Joppa snapshots", delta_apply(first, made) == second))
+    history = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub-store", "history",
+        "JoppaWorld.11.22.1.1.10")
+    if os.path.isdir(history):
+        sizes, kept = churn(history, every=10)
+        print("      recorded Joppa updates: difference median %d bytes packed" % sorted(sizes)[len(sizes) // 2])
+        checks.append(("difference of recorded Joppa updates (%d pairs)" % len(sizes), kept))
     for name, passed in checks:
         print(("ok    " if passed else "FAIL  ") + name)
     return all(passed for _, passed in checks)
+
+
+def churn(folder, every=1):
+    """Packed difference sizes between consecutive recorded snapshots in a --history folder, and whether all of
+    them rebuild exactly."""
+    names = sorted(name for name in os.listdir(folder) if name.endswith(".bin"))
+    sizes, kept = [], True
+    for i in range(0, len(names) - 1, every):
+        old, new = (unpack(open(os.path.join(folder, name), "rb").read()) for name in names[i:i + 2])
+        made = delta_make(old, new)
+        kept = kept and delta_apply(old, made) == new
+        sizes.append(len(gzip.compress(made)))
+    return sizes, kept
+
+
+def show_churn(folder):
+    names = sorted(name for name in os.listdir(folder) if name.endswith(".bin"))
+    whole = sorted(len(open(os.path.join(folder, name), "rb").read()) for name in names)
+    sizes, kept = churn(folder)
+    sizes.sort()
+
+    def spread(values):
+        return "median %d, p90 %d, max %d" % (values[len(values) // 2], values[len(values) * 9 // 10], values[-1])
+
+    print("%d snapshots" % len(names))
+    print("whole, packed:      " + spread(whole))
+    print("difference, packed: " + spread(sizes))
+    print("every difference rebuilds its snapshot: " + ("yes" if kept else "NO"))
 
 
 def strings_in(data):
@@ -848,7 +936,7 @@ def compare(path_a, path_b):
 
 
 def main():
-    global TICK
+    global TICK, HISTORY
     parser = argparse.ArgumentParser(description="Test hub for the QUDOnline mod.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7777)
@@ -856,13 +944,20 @@ def main():
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--new-world", action="store_true", help="forget the shared world and start a new one")
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    parser.add_argument("--churn", metavar="FOLDER", help="difference sizes between the snapshots of a history folder")
+    parser.add_argument("--history", action="store_true",
+        help="also keep every store of a world zone in hub-store/history/<zone>/")
     args = parser.parse_args()
     if args.selftest:
         sys.exit(0 if selftest() else 1)
     if args.compare:
         compare(*args.compare)
         return
+    if args.churn:
+        show_churn(args.churn)
+        return
     TICK = args.tick
+    HISTORY = args.history
     if args.new_world:
         new_world()
         say("the old world is forgotten")
@@ -870,6 +965,8 @@ def main():
     hub = Hub((args.host, args.port), Handler)
     say("hub listening on %s:%d, storing zones in %s (Ctrl-C to stop)" % (args.host, args.port, STORE_DIR))
     say("world seed %s, %d zones stored" % (world_seed(), zones))
+    if HISTORY:
+        say("keeping every store of a world zone in %s" % os.path.join(STORE_DIR, "history"))
     try:
         hub.serve_forever()
     except KeyboardInterrupt:
