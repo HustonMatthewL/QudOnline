@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<embarkmodules>
+
+  <!-- gives a new game the seed of the hub's world when a hub is running; has no window -->
+  <module Class="QudOnline.OnlineEmbark">
+  </module>
+
+</embarkmodules>
