@@ -4,11 +4,10 @@
 
 Every player runs a full, normal game. A small hub relays where everyone is and stores the zones of one shared
 world. Each zone has an owner, the first player to arrive: the owner's game simulates the zone and stores it on
-the hub. The other players in that zone see a live mirror of it, and what they do there (items dropped or picked
-up, hits on creatures, walls and doors) is sent to the owner, who applies it. While several players share a zone,
-time moves in rounds, so everyone gets a turn. The other players appear as real copies of their characters.
+the hub. The other players in that zone see a live mirror of it, and what they do there is sent to the owner, who applies it. 
+While several players share a zone, time moves in rounds, so everyone gets a turn. The other players appear as real copies of their characters.
 
-Built for game version 2.0.211. Scripts only; no Harmony patches.
+Built for game version 2.0.211.
 
 **Status:** an early test build. It is only meant for two games on one machine or a trusted local network, and
 it adds nothing to the game except the test wishes below.
@@ -20,7 +19,7 @@ it adds nothing to the game except the test wishes below.
    - Windows: `%USERPROFILE%\AppData\LocalLow\Freehold Games\CavesOfQud\Mods`
    - macOS: `~/Library/Application Support/com.FreeholdGames.CavesOfQud/Mods`
    - Linux: `~/.config/unity3d/Freehold Games/CavesOfQud/Mods`
-2. Start the hub (Python 3, standard library only):
+2. Start the hub Python 3:
 
    ```sh
    python3 hub/online_hub.py                # listens on 127.0.0.1:7777
